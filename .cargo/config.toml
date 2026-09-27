@@ -1,0 +1,3 @@
+[registries.univers]
+index = "sparse+https://david-server.mink-ph.ts.net/api/v1/crates/"
+credential-provider = ["cargo:token"]
