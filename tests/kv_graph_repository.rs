@@ -1,7 +1,8 @@
 //! Tests for KvGraphRepository — uses an in-memory KvStore mock.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use univers_aip_contracts_data::storage::{
@@ -13,11 +14,11 @@ use univers_aip_lib_storage_kv_graph::KvGraphRepository;
 
 // ── minimal in-memory KvStore for testing ───────────────────
 
-struct MemKv(Mutex<BTreeMap<String, Vec<u8>>>);
+struct MemKv(Mutex<BTreeMap<String, Vec<u8>>>, AtomicUsize, bool);
 
 impl MemKv {
     fn new() -> Self {
-        Self(Mutex::new(BTreeMap::new()))
+        Self(Mutex::new(BTreeMap::new()), AtomicUsize::new(0), true)
     }
 }
 
@@ -27,6 +28,14 @@ impl KvStore for MemKv {
         &self,
         prefixes: &[String],
     ) -> univers_aip_contracts_data::storage::RepositoryResult<Vec<Vec<(String, Vec<u8>)>>> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        if !self.2 {
+            return Err(
+                univers_aip_contracts_data::storage::RepositoryError::validation(
+                    "snapshot prefix scans are unavailable",
+                ),
+            );
+        }
         let values = self.0.lock().unwrap();
         Ok(prefixes
             .iter()
@@ -756,4 +765,169 @@ async fn sweep_entity_removes_both_directions_and_twins() {
 
     // Idempotent: re-sweeping a clean entity is a no-op.
     assert_eq!(repo.sweep_entity("t", "a").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn snapshot_exports_the_entire_graph_with_original_bytes_and_actual_endpoints() {
+    let (repository, store) = repo_with_store();
+    for id in 0..1001 {
+        repository
+            .relate("source", "root", "target", &id.to_string(), "k")
+            .await
+            .unwrap();
+    }
+    // Historical raw metadata preserves JSON spelling, wide integers and null.
+    let raw = b"{ \"wide\":18446744073709551615, \"nullable\":null }".to_vec();
+    {
+        let mut values = store.0.lock().unwrap();
+        values.insert(
+            "e\x1fsource\x1froot\x1fk\x1ftarget\x1f0".into(),
+            raw.clone(),
+        );
+        values.insert(
+            "r\x1ftarget\x1f0\x1fk\x1fsource\x1froot".into(),
+            raw.clone(),
+        );
+    }
+    repository
+        .relate_with_metadata("s", "null", "t", "null", "k", serde_json::Value::Null)
+        .await
+        .unwrap();
+    let fence = |revision| RelationProjectionFence {
+        owner: "stored-row".into(),
+        revision,
+    };
+    repository
+        .upsert_relation_projection("s", "live", "t", "live", "k", Default::default(), fence(1))
+        .await
+        .unwrap();
+    repository
+        .delete_relation_projection("s", "gone", "t", "gone", "k", fence(2))
+        .await
+        .unwrap();
+    let before = store.0.lock().unwrap().clone();
+    let snapshot = repository.snapshot_export().await.unwrap();
+    assert_eq!(store.1.load(Ordering::SeqCst), 1);
+    assert_eq!(*store.0.lock().unwrap(), before);
+    assert_eq!(snapshot.edges.len(), 1003);
+    let edge = snapshot
+        .edges
+        .iter()
+        .find(|edge| edge.source.table == "source" && edge.target.id == "0")
+        .unwrap();
+    assert_eq!(edge.physical_key, "e\x1fsource\x1froot\x1fk\x1ftarget\x1f0");
+    assert_eq!(edge.source.id, "root");
+    assert_eq!(edge.target.table, "target");
+    assert_eq!(edge.kind, "k");
+    assert_eq!(edge.raw_metadata, raw);
+    assert_eq!(
+        edge.metadata.as_ref().unwrap()["wide"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert!(edge.metadata.as_ref().unwrap()["nullable"].is_null());
+    assert!(snapshot.edges.iter().any(|edge| edge.metadata.is_none()));
+    assert!(snapshot
+        .edges
+        .iter()
+        .any(|edge| edge.metadata == Some(serde_json::Value::Null)));
+    assert!(snapshot.edges.iter().any(|edge| edge.source.id == "live"));
+    assert!(snapshot
+        .endpoints
+        .iter()
+        .all(|endpoint| endpoint.id != "gone"));
+    // Only endpoint pairs are available, not synthesized entity properties.
+    assert!(repository
+        .get_record_json("source", "root")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn snapshot_rejects_bad_indexes_and_metadata_without_changing_any_key() {
+    let (repository, store) = repo_with_store();
+    repository.relate("s", "1", "t", "2", "k").await.unwrap();
+    let original = store.0.lock().unwrap().clone();
+    let forward = "e\x1fs\x1f1\x1fk\x1ft\x1f2";
+    let reverse = "r\x1ft\x1f2\x1fk\x1fs\x1f1";
+    let state = "p\x1fs\x1f1\x1fk\x1ft\x1f2";
+    let mut corruptions = Vec::new();
+    let mut values = original.clone();
+    values.remove(forward);
+    corruptions.push(values);
+    let mut values = original.clone();
+    values.remove(reverse);
+    corruptions.push(values);
+    let mut values = original.clone();
+    values.insert(reverse.into(), b"null".to_vec());
+    corruptions.push(values);
+    let mut values = original.clone();
+    let raw = values.remove(forward).unwrap();
+    values.insert(format!("{forward}\x1fextra"), raw);
+    corruptions.push(values);
+    let mut values = original.clone();
+    values.insert(forward.into(), b"{invalid".to_vec());
+    values.insert(reverse.into(), b"{invalid".to_vec());
+    corruptions.push(values);
+    let mut values = original.clone();
+    values.insert(state.into(), b"unknown-state".to_vec());
+    corruptions.push(values);
+    for values in corruptions {
+        *store.0.lock().unwrap() = values.clone();
+        assert!(repository.snapshot_export().await.is_err());
+        assert_eq!(*store.0.lock().unwrap(), values);
+    }
+}
+
+#[tokio::test]
+async fn snapshot_does_not_export_incomplete_projection_repairs_or_tombstone_edges() {
+    let (repository, store) = repo_with_store();
+    let fence = |revision| RelationProjectionFence {
+        owner: "stored-row".into(),
+        revision,
+    };
+    repository
+        .upsert_relation_projection("s", "1", "t", "2", "k", Default::default(), fence(1))
+        .await
+        .unwrap();
+    let original = store.0.lock().unwrap().clone();
+    let forward = "e\x1fs\x1f1\x1fk\x1ft\x1f2";
+    let reverse = "r\x1ft\x1f2\x1fk\x1fs\x1f1";
+    let state = "p\x1fs\x1f1\x1fk\x1ft\x1f2";
+    for keys in [vec![forward], vec![forward, reverse], vec![state]] {
+        let mut values = original.clone();
+        for key in keys {
+            values.remove(key);
+        }
+        *store.0.lock().unwrap() = values.clone();
+        assert!(repository.snapshot_export().await.is_err());
+        assert_eq!(*store.0.lock().unwrap(), values);
+    }
+    *store.0.lock().unwrap() = original.clone();
+    repository
+        .delete_relation_projection("s", "1", "t", "2", "k", fence(2))
+        .await
+        .unwrap();
+    assert!(repository.snapshot_export().await.unwrap().edges.is_empty());
+    let mut values = store.0.lock().unwrap().clone();
+    values.insert(forward.into(), original[forward].clone());
+    values.insert(reverse.into(), original[reverse].clone());
+    *store.0.lock().unwrap() = values.clone();
+    assert!(repository.snapshot_export().await.is_err());
+    assert_eq!(*store.0.lock().unwrap(), values);
+}
+
+#[tokio::test]
+async fn snapshot_capability_is_required_without_falling_back_to_separate_scans() {
+    let store = Arc::new(MemKv(
+        Mutex::new(BTreeMap::new()),
+        AtomicUsize::new(0),
+        false,
+    ));
+    let repository = KvGraphRepository::new(store.clone());
+    repository.relate("s", "1", "t", "2", "k").await.unwrap();
+    let before = store.0.lock().unwrap().clone();
+    assert!(repository.snapshot_export().await.is_err());
+    assert_eq!(store.1.load(Ordering::SeqCst), 1);
+    assert_eq!(*store.0.lock().unwrap(), before);
 }

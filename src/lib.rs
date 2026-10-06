@@ -27,6 +27,9 @@ use univers_aip_contracts_data::storage::graph_repository::{
 };
 use univers_aip_contracts_data::storage::kv_store::KvStore;
 
+mod export;
+pub use export::{GraphEndpoint, GraphSnapshot, GraphSnapshotEdge};
+
 const SEP: char = '\u{001f}';
 const FORWARD: &str = "e\u{001f}";
 const REVERSE: &str = "r\u{001f}";

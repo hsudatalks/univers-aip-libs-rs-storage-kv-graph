@@ -13,10 +13,29 @@ existing per-operation behavior; they do not promise a multi-call transaction.
 
 The initial implementation and existing regression tests come from
 `hvac-workbench` commit `04b106a8467975276bfe70577b3d1e824521492e`, `apps/adapters/univers-storage-kv-graph`.
-The source has no implementation changes beyond its public package import and
-corrected documentation of the required KV capabilities.
+That history remains readable; the export below adds no storage keys or format changes.
 
-Add `univers-aip-lib-storage-kv-graph = {version="=0.1.0",registry="univers"}`.
+## Complete read-only graph export
+
+`KvGraphRepository::snapshot_export().await` returns `GraphSnapshot { edges,
+endpoints }`. Each `GraphSnapshotEdge` carries its exact stored `physical_key`
+(the old edge's only physical ID), `source` and `target` (`GraphEndpoint { table,
+id }`), `kind`, `metadata: Option<serde_json::Value>` and `raw_metadata: Vec<u8>`.
+Empty legacy bytes mean no metadata; JSON null remains a present value. Original
+bytes retain formatting and stored projection fields. Edges are ordered by their
+original forward keys; endpoints are unique `(table, id)` pairs. This repository
+stores no entity bodies or node properties, so the export does not fabricate them.
+
+One `KvStore::scan_prefixes` call reads the forward, reverse and projection-state
+indexes from the backend's same logical read snapshot. An unsupported backend
+returns an error rather than separate scans. The export checks all index pairs,
+metadata and durable projection states. Valid tombstones are omitted; mismatched
+indexes, malformed keys/JSON or incomplete live-edge repairs fail the whole read.
+The read never writes, repairs, initializes or deletes data. It fully materializes
+the backend snapshot and is not a cursor spanning independent transactions.
+
+Use `univers-aip-lib-storage-kv-graph = {version="=0.1.1",registry="univers"}`;
+0.1.0 does not expose the new export.
 The release lock validates C0 Data rc.2. Run `bash scripts/check.sh`,
 `bash scripts/build.sh`, and `bash scripts/publish.sh` from an unchanged clean
 committed candidate. Registry configuration is included; credentials are external.
